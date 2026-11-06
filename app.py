@@ -129,7 +129,7 @@ elif page == "Master Data":
     st.header("🗄️ Central Master Data Repository")
     tabs = st.tabs(["📤 Upload New Master Records", "⚙️ Manage & Clear Duplicates"])
     
-    with tabs:
+    with tabs[0]:
         st.subheader("Upload 5-Columns Sheet permanently to Turso Cloud")
         master_file = st.file_uploader("Choose Master Excel Sheet", type=["xlsx"], key="master_upload")
         if master_file:
@@ -150,7 +150,7 @@ elif page == "Master Data":
                 client.close()
                 st.success(f"Successfully saved {len(df_master)} records permanently to Turso cloud database!")
                 
-    with tabs:
+    with tabs[1]:
         st.subheader("Bulk Row Deletion Zone (Paste 'X' to remove rows)")
         client = get_db_client()
         res = client.execute("SELECT id, barcode, order_no, creation_date, resolve_date, remarks FROM master_data LIMIT 1000")
@@ -158,7 +158,7 @@ elif page == "Master Data":
         client.close()
         
         if db_rows:
-            grid_data = [{"Select": "", "ID": r, "Barcode": r, "Order No": r, "Creation Date": r, "Resolve Date": r, "Remarks": r} for r in db_rows]
+            grid_data = [{"Select": "", "ID": r[0], "Barcode": r[1], "Order No": r[2], "Creation Date": r[3], "Resolve Date": r[4], "Remarks": r[5]} for r in db_rows]
             df_grid = pd.DataFrame(grid_data)
             
             edited_df = st.data_editor(df_grid, column_config={"ID": st.column_config.NumberColumn(disabled=True)}, num_rows="dynamic")
@@ -206,5 +206,3 @@ elif page == "Export / Backup":
     st.header("💾 System Export & Offline Backup")
     st.markdown("Click below to download the pure raw database structure state as an Excel Backup sheet.")
     
-    if st.button("Generate Central Backup Sheet"):
-        client = get_db_client()
