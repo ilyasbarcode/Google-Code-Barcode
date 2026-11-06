@@ -107,9 +107,6 @@ if page == "Barcode Checking Portal":
     file = st.file_uploader("Upload Excel File (.xlsx)", type=["xlsx"])
     if file:
         df_uploaded = pd.read_excel(file)
-        # Rename flexibility helper to match inner casing rules smoothly
-        df_uploaded.rename(columns={"Order No": "Order No"}, inplace=True)
-        
         if st.button("Process & Generate Sheet"):
             with st.spinner("Executing calculations..."):
                 processed_df = calculate_warranty_durations(df_uploaded)
@@ -154,13 +151,33 @@ elif page == "Master Data":
         st.subheader("Bulk Row Deletion Zone (Paste 'X' to remove rows)")
         client = get_db_client()
         res = client.execute("SELECT id, barcode, order_no, creation_date, resolve_date, remarks FROM master_data LIMIT 1000")
-        db_rows = res.rows
+        
+        # New Libsql API standard structure check adaptation
+        db_rows = []
+        if hasattr(res, 'rows') and res.rows:
+            db_rows = res.rows
+        elif isinstance(res, list):
+            db_rows = res
+            
         client.close()
         
         if db_rows:
-            grid_data = [{"Select": "", "ID": r[0], "Barcode": r[1], "Order No": r[2], "Creation Date": r[3], "Resolve Date": r[4], "Remarks": r[5]} for r in db_rows]
+            grid_data = []
+            for r in db_rows:
+                # Adapting to dictionary row items or tuple row styles seamlessly
+                if hasattr(r, 'keys') or isinstance(r, dict):
+                    grid_data.append({
+                        "Select": "", "ID": r.get("id"), "Barcode": r.get("barcode"), 
+                        "Order No": r.get("order_no"), "Creation Date": r.get("creation_date"), 
+                        "Resolve Date": r.get("resolve_date"), "Remarks": r.get("remarks")
+                    })
+                else:
+                    grid_data.append({
+                        "Select": "", "ID": r[0], "Barcode": r[1], "Order No": r[2], 
+                        "Creation Date": r[3], "Resolve Date": r[4], "Remarks": r[5]
+                    })
+                    
             df_grid = pd.DataFrame(grid_data)
-            
             edited_df = st.data_editor(df_grid, column_config={"ID": st.column_config.NumberColumn(disabled=True)}, num_rows="dynamic")
             selected_rows = edited_df[edited_df['Select'].str.upper() == 'X']
             
@@ -186,23 +203,15 @@ elif page == "Warranty Search":
     if search_query:
         client = get_db_client()
         res = client.execute("SELECT barcode, order_no, creation_date, resolve_date, remarks FROM master_data WHERE barcode = ? ORDER BY id ASC", [search_query.strip()])
-        rows = res.rows
+        
+        rows = []
+        if hasattr(res, 'rows') and res.rows:
+            rows = res.rows
+        elif isinstance(res, list):
+            rows = res
+            
         client.close()
         
         if rows:
-            # Reconstruct raw records safely back into lookback dataframes
-            cols = ["Barcode", "Order No", "Creation Date", "Resolve Date", "Remarks"]
-            df_query = pd.DataFrame([list(r) for r in rows], columns=cols)
-            
-            # Fire lookback calculator engine logic dynamically
-            processed_query_df = calculate_warranty_durations(df_query)
-            st.success("Tracking footprints located inside database!")
-            st.dataframe(processed_query_df)
-        else:
-            st.warning("No tracking history found inside central cloud server for this barcode.")
-
-# --- 4. EXPORT / BACKUP (Extract pure 5 columns raw archive storage state) ---
-elif page == "Export / Backup":
-    st.header("💾 System Export & Offline Backup")
-    st.markdown("Click below to download the pure raw database structure state as an Excel Backup sheet.")
-    
+            query_list = []
+            for r in rows:
