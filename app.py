@@ -8,7 +8,7 @@ import requests
 TURSO_URL = st.secrets.get("TURSO_URL", "https://turso.io")
 TURSO_AUTH_TOKEN = st.secrets.get("TURSO_AUTH_TOKEN", "")
 
-# Standardized direct API caller function
+# Standardized direct HTTP pipeline executor
 def query_turso(statements):
     url = TURSO_URL
     if url.startswith("libsql://"):
@@ -27,10 +27,7 @@ def query_turso(statements):
         
         formatted_args = []
         for p in params:
-            if isinstance(p, int):
-                formatted_args.append({"type": "integer", "value": str(p)})
-            else:
-                formatted_args.append({"type": "text", "value": str(p)})
+            formatted_args.append({"type": "text", "value": str(p)})
                 
         requests_payload.append({
             "type": "execute",
@@ -47,27 +44,21 @@ def query_turso(statements):
         if response.status_code == 200:
             res_json = response.json()
             results = res_json.get("results", [])
-            output = []
-            for r in results:
-                if r.get("type") == "execute":
-                    exec_res = r.get("response", {}).get("result", {})
-                    cols = [c.get("name") for c in exec_res.get("cols", [])]
-                    rows_data = exec_res.get("rows", [])
-                    
-                    parsed_rows = []
-                    for row in rows_data:
-                        parsed_row = []
-                        for cell in row:
-                            parsed_row.append(cell.get("value"))
-                        parsed_rows.append(dict(zip(cols, parsed_row)))
-                    output.append(parsed_rows)
-                else:
-                    output.append([])
-            return output
-        else:
-            return [[] for _ in statements]
+            if results and results[0].get("type") == "execute":
+                exec_res = results[0].get("response", {}).get("result", {})
+                cols = [c.get("name") for c in exec_res.get("cols", [])]
+                rows_data = exec_res.get("rows", [])
+                
+                parsed_rows = []
+                for row in rows_data:
+                    parsed_row = []
+                    for cell in row:
+                        parsed_row.append(cell.get("value"))
+                    parsed_rows.append(dict(zip(cols, parsed_row)))
+                return parsed_rows
     except:
-        return [[] for _ in statements]
+        pass
+    return []
 
 def init_db():
     sql = """
@@ -192,8 +183,7 @@ elif page == "Master Data":
                 
     with tabs[1]:
         st.subheader("Bulk Row Deletion Zone (Paste 'X' to remove rows)")
-        res = query_turso([["SELECT id, barcode, order_no, creation_date, resolve_date, remarks FROM master_data LIMIT 1000"]])
-        db_rows = res[0] if res else []
+        db_rows = query_turso([["SELECT id, barcode, order_no, creation_date, resolve_date, remarks FROM master_data LIMIT 1000"]])
         
         if db_rows:
             grid_data = []
@@ -232,3 +222,8 @@ elif page == "Warranty Search":
     search_query = st.text_input("Enter Barcode:")
     
     if search_query:
+        rows = query_turso([["SELECT barcode, order_no, creation_date, resolve_date, remarks FROM master_data WHERE barcode = ? ORDER BY id ASC", [search_query.strip()]]])
+        
+        if rows:
+            query_list = []
+            for r in rows:
