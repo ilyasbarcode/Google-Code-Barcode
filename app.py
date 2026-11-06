@@ -2,31 +2,88 @@ import streamlit as st
 import pandas as pd
 import datetime
 import io
-import libsql_client as libsql
+import requests
 
-# 1. Secure Database Setup
+# 1. Secure Database Setup via Direct HTTP API
 TURSO_URL = st.secrets.get("TURSO_URL", "https://turso.io")
 TURSO_AUTH_TOKEN = st.secrets.get("TURSO_AUTH_TOKEN", "")
 
-def get_db_client():
-    if TURSO_URL.startswith("sqlite://"):
-        return libsql.create_client_sync(url=TURSO_URL)
-    return libsql.create_client_sync(url=TURSO_URL, auth_token=TURSO_AUTH_TOKEN)
+# Standardized direct API caller function
+def query_turso(statements):
+    # Standardizing URL format for HTTP endpoint
+    url = TURSO_URL
+    if url.startswith("libsql://"):
+        url = url.replace("libsql://", "https://")
+    
+    endpoint = f"{url.rstrip('/')}/v2/pipeline"
+    headers = {
+        "Authorization": f"Bearer {TURSO_AUTH_TOKEN}",
+        "Content-Type": "application/json"
+    }
+    
+    # Building pipeline requests standard format
+    requests_payload = []
+    for stmt in statements:
+        sql = stmt[0]
+        params = stmt[1] if len(stmt) > 1 else []
+        
+        # Format parameters for Turso API
+        formatted_args = []
+        for p in params:
+            if isinstance(p, int):
+                formatted_args.append({"type": "integer", "value": str(p)})
+            else:
+                formatted_args.append({"type": "text", "value": str(p)})
+                
+        requests_payload.append({
+            "type": "execute",
+            "stmt": {
+                "sql": sql,
+                "args": formatted_args
+            }
+        })
+        
+    payload = {"requests": requests_payload}
+    
+    try:
+        response = requests.post(endpoint, json=payload, headers=headers)
+        if response.status_code == 200:
+            res_json = response.json()
+            results = res_json.get("results", [])
+            output = []
+            for r in results:
+                if r.get("type") == "execute":
+                    exec_res = r.get("response", {}).get("result", {})
+                    cols = [c.get("name") for c in exec_res.get("cols", [])]
+                    rows_data = exec_res.get("rows", [])
+                    
+                    parsed_rows = []
+                    for row in rows_data:
+                        parsed_row = []
+                        for cell in row:
+                            parsed_row.append(cell.get("value"))
+                        parsed_rows.append(dict(zip(cols, parsed_row)))
+                    output.append(parsed_rows)
+                else:
+                    output.append([])
+            return output
+        else:
+            return [[] for _ in statements]
+    except:
+        return [[] for _ in statements]
 
-# Clean Database Initialization (Strictly 5 Data Columns + ID)
 def init_db():
-    client = get_db_client()
-    client.execute("""
-        CREATE TABLE IF NOT EXISTS master_data (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            barcode TEXT,
-            order_no TEXT,
-            creation_date TEXT,
-            resolve_date TEXT,
-            remarks TEXT
-        )
-    """)
-    client.close()
+    sql = """
+    CREATE TABLE IF NOT EXISTS master_data (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        barcode TEXT,
+        order_no TEXT,
+        creation_date TEXT,
+        resolve_date TEXT,
+        remarks TEXT
+    )
+    """
+    query_turso([[sql]])
 
 init_db()
 
@@ -34,16 +91,13 @@ init_db()
 def calculate_warranty_durations(df_input):
     df = df_input.copy()
     
-    # Standardizing incoming data text
     df['Barcode'] = df['Barcode'].astype(str).str.strip()
     df['Remarks'] = df['Remarks'].astype(str).str.strip()
     
-    # Preparing the 13-columns structural layout columns
     extended_cols = ["Previous Order Number", "Previous Resolve Date", "Compressor Warranty", "Gas Warranty", "Parts Warranty", "Service Warranty", "Col11", "Col12", "Col13"]
     for col in extended_cols:
         df[col] = "—"
         
-    # Process sequential lookback logic row by row
     for idx, row in df.iterrows():
         current_barcode = row['Barcode']
         current_material = row['Remarks']
@@ -53,7 +107,6 @@ def calculate_warranty_durations(df_input):
         except:
             continue
             
-        # Scan behind inside current context for identical tracking footprints
         past_records = df.iloc[:idx]
         match_condition = (past_records['Barcode'] == current_barcode) & (past_records['Remarks'] == current_material)
         matched_history = past_records[match_condition]
@@ -70,7 +123,6 @@ def calculate_warranty_durations(df_input):
                 last_resolve_dt = pd.to_datetime(last_resolve_raw)
                 days_diff = (current_create_dt - last_resolve_dt).days
                 
-                # Dynamic matching based on material category limits
                 if current_material.lower() in ['compressor', 'gas']:
                     if days_diff <= 90:
                         target_col = "Compressor Warranty" if 'compressor' in current_material.lower() else "Gas Warranty"
@@ -82,9 +134,7 @@ def calculate_warranty_durations(df_input):
             except:
                 pass
                 
-    # Standardizing layout to final 13-columns sequence output order
     final_sequence = ["Barcode", "Order No", "Creation Date", "Resolve Date", "Remarks", "Previous Order Number", "Previous Resolve Date", "Compressor Warranty", "Gas Warranty", "Parts Warranty", "Service Warranty", "Col11", "Col12", "Col13"]
-    # Keep only available output fields gracefully
     existing_cols = [c for c in final_sequence if c in df.columns]
     return df[existing_cols]
 
@@ -99,7 +149,7 @@ st.set_page_config(page_title="Barcode Portal", layout="wide")
 st.sidebar.title("📌 Portal Menu")
 page = st.sidebar.radio("Navigate", ["Barcode Checking Portal", "Master Data", "Warranty Search", "Export / Backup"])
 
-# --- 1. BARCODE CHECKING PORTAL (Process and download instantly) ---
+# --- 1. BARCODE CHECKING PORTAL ---
 if page == "Barcode Checking Portal":
     st.header("📋 Barcode Checking Portal")
     st.info("Upload an Excel file with these columns: Barcode, Order No, Creation Date, Resolve Date, Remarks.")
@@ -121,7 +171,7 @@ if page == "Barcode Checking Portal":
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 )
 
-# --- 2. MASTER DATA (Store purely 5 data columns on cloud database node) ---
+# --- 2. MASTER DATA ---
 elif page == "Master Data":
     st.header("🗄️ Central Master Data Repository")
     tabs = st.tabs(["📤 Upload New Master Records", "⚙️ Manage & Clear Duplicates"])
@@ -133,52 +183,33 @@ elif page == "Master Data":
             df_master = pd.read_excel(master_file)
             st.write("Preview:", df_master.head(3))
             if st.button("Sync & Save to Turso Cloud Server"):
-                client = get_db_client()
+                batch_inserts = []
                 for _, row in df_master.iterrows():
-                    client.execute(
-                        """INSERT INTO master_data (barcode, order_no, creation_date, resolve_date, remarks) 
-                        VALUES (?, ?, ?, ?, ?)""",
-                        [
-                            str(row.get('Barcode', '')), str(row.get('Order No', '')), 
-                            str(row.get('Creation Date', '')), str(row.get('Resolve Date', '')), 
-                            str(row.get('Remarks', ''))
-                        ]
-                    )
-                client.close()
+                    sql = "INSERT INTO master_data (barcode, order_no, creation_date, resolve_date, remarks) VALUES (?, ?, ?, ?, ?)"
+                    params = [str(row.get('Barcode', '')), str(row.get('Order No', '')), str(row.get('Creation Date', '')), str(row.get('Resolve Date', '')), str(row.get('Remarks', ''))]
+                    batch_inserts.append([sql, params])
+                
+                if batch_inserts:
+                    query_turso(batch_inserts)
                 st.success(f"Successfully saved {len(df_master)} records permanently to Turso cloud database!")
                 
     with tabs[1]:
         st.subheader("Bulk Row Deletion Zone (Paste 'X' to remove rows)")
-        client = get_db_client()
-        res = client.execute("SELECT id, barcode, order_no, creation_date, resolve_date, remarks FROM master_data LIMIT 1000")
-        
-        db_rows = []
-        if hasattr(res, 'rows') and res.rows:
-            db_rows = res.rows
-        elif isinstance(res, list):
-            db_rows = res
-            
-        client.close()
+        res = query_turso([["SELECT id, barcode, order_no, creation_date, resolve_date, remarks FROM master_data LIMIT 1000"]])
+        db_rows = res[0] if res else []
         
         if db_rows:
             grid_data = []
             for r in db_rows:
-                if hasattr(r, 'keys') or isinstance(r, dict):
-                    grid_data.append({
-                        "Select": "", "ID": r.get("id"), "Barcode": r.get("barcode"), 
-                        "Order No": r.get("order_no"), "Creation Date": r.get("creation_date"), 
-                        "Resolve Date": r.get("resolve_date"), "Remarks": r.get("remarks")
-                    })
-                elif isinstance(r, (list, tuple)) and len(r) >= 6:
-                    grid_data.append({
-                        "Select": "", "ID": r[0], "Barcode": r[1], "Order No": r[2], 
-                        "Creation Date": r[3], "Resolve Date": r[4], "Remarks": r[5]
-                    })
-                else:
-                    grid_data.append({
-                        "Select": "", "ID": str(r), "Barcode": str(r), "Order No": str(r), 
-                        "Creation Date": str(r), "Resolve Date": str(r), "Remarks": str(r)
-                    })
+                grid_data.append({
+                    "Select": "", 
+                    "ID": r.get("id"), 
+                    "Barcode": r.get("barcode"), 
+                    "Order No": r.get("order_no"), 
+                    "Creation Date": r.get("creation_date"), 
+                    "Resolve Date": r.get("resolve_date"), 
+                    "Remarks": r.get("remarks")
+                })
                     
             df_grid = pd.DataFrame(grid_data)
             edited_df = st.data_editor(df_grid, column_config={"ID": st.column_config.NumberColumn(disabled=True)}, num_rows="dynamic")
@@ -189,26 +220,10 @@ elif page == "Master Data":
                 confirm = st.checkbox("Verify permanent action strike")
                 if st.button("Execute Permanent Delete"):
                     if confirm:
-                        client = get_db_client()
+                        batch_deletes = []
                         for idx in selected_rows['ID'].tolist():
-                            client.execute("DELETE FROM master_data WHERE id = ?", [idx])
-                        client.close()
+                            batch_deletes.append(["DELETE FROM master_data WHERE id = ?", [int(idx)]])
+                        query_turso(batch_deletes)
                         st.success("Selected records cleared successfully!")
                         st.rerun()
         else:
-            st.info("Database table is empty.")
-
-# --- 3. WARRANTY SEARCH (Queries 5 columns from Turso, dynamic evaluation to 13 columns layout) ---
-elif page == "Warranty Search":
-    st.header("🔍 Direct Live Warranty Search")
-    search_query = st.text_input("Enter Barcode:")
-    
-    if search_query:
-        client = get_db_client()
-        res = client.execute("SELECT barcode, order_no, creation_date, resolve_date, remarks FROM master_data WHERE barcode = ? ORDER BY id ASC", [search_query.strip()])
-        
-        rows = []
-        if hasattr(res, 'rows') and res.rows:
-            rows = res.rows
-        elif isinstance(res, list):
-            rows = res
