@@ -1,10 +1,8 @@
 import streamlit as st
 import pandas as pd
-import sqlite3
 import hmac
 import re
 from io import BytesIO
-from pathlib import Path
 
 # ---------------------------------------------------------
 # PAGE SETTINGS
@@ -15,7 +13,6 @@ st.set_page_config(
     layout="wide"
 )
 
-DB_PATH = Path("barcode_history.db")
 
 # ---------------------------------------------------------
 # LOGIN SECURITY
@@ -64,35 +61,6 @@ with st.sidebar:
     if st.button("Logout", use_container_width=True):
         st.session_state.logged_in = False
         st.rerun()
-
-# ---------------------------------------------------------
-# DATABASE
-# ---------------------------------------------------------
-def get_connection():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS barcode_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            order_number TEXT NOT NULL DEFAULT '',
-            barcode TEXT NOT NULL,
-            creation_date TEXT NOT NULL,
-            resolve_date TEXT NOT NULL,
-            remarks TEXT NOT NULL DEFAULT '',
-            UNIQUE(barcode, creation_date, resolve_date)
-        )
-        """
-    )
-    existing_columns = {
-        row[1] for row in conn.execute("PRAGMA table_info(barcode_history)").fetchall()
-    }
-    if "order_number" not in existing_columns:
-        conn.execute("ALTER TABLE barcode_history ADD COLUMN order_number TEXT NOT NULL DEFAULT ''")
-    if "remarks" not in existing_columns:
-        conn.execute("ALTER TABLE barcode_history ADD COLUMN remarks TEXT NOT NULL DEFAULT ''")
-    conn.commit()
-    return conn
-
 
 # Recognized terms from the user's material list. Longer names are checked first
 # so "Door Gasket 400SAX Chest" is not confused with "Door Gasket 400SAX".
@@ -149,61 +117,6 @@ def gap_result(current_creation, previous_resolve):
     return "After 90 Days", days
 
 
-def load_history():
-    conn = get_connection()
-    try:
-        history = pd.read_sql_query(
-            "SELECT order_number, barcode, creation_date, resolve_date, remarks FROM barcode_history",
-            conn
-        )
-    finally:
-        conn.close()
-
-    records = []
-    for _, row in history.iterrows():
-        creation = pd.to_datetime(row["creation_date"], errors="coerce")
-        resolve = pd.to_datetime(row["resolve_date"], errors="coerce")
-        if pd.notna(creation) and pd.notna(resolve):
-            records.append({
-                "Order Number": str(row.get("order_number", "") or ""),
-                "Barcode": str(row["barcode"]),
-                "Creation Date": creation,
-                "Resolve Date": resolve,
-                "Remarks": str(row.get("remarks", "") or ""),
-                "Materials": detect_materials(row.get("remarks", "")),
-            })
-    return records
-
-
-def save_history(rows):
-    """Save barcode/date records and Remarks for future material warranty checks."""
-    conn = get_connection()
-    try:
-        conn.executemany(
-            """
-            INSERT INTO barcode_history
-                (order_number, barcode, creation_date, resolve_date, remarks)
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(barcode, creation_date, resolve_date) DO UPDATE SET
-                order_number = CASE WHEN excluded.order_number != '' THEN excluded.order_number ELSE barcode_history.order_number END,
-                remarks = CASE WHEN excluded.remarks != '' THEN excluded.remarks ELSE barcode_history.remarks END
-            """,
-            [
-                (
-                    str(row.get("Order Number", "") or ""),
-                    str(row["Barcode"]),
-                    pd.Timestamp(row["Creation Date"]).strftime("%Y-%m-%d %H:%M:%S"),
-                    pd.Timestamp(row["Resolve Date"]).strftime("%Y-%m-%d %H:%M:%S"),
-                    str(row.get("Remarks", "") or ""),
-                )
-                for row in rows
-            ]
-        )
-        conn.commit()
-    finally:
-        conn.close()
-
-
 def check_barcodes(input_df, saved_history):
     """Check each warranty category independently and show separate result columns."""
     working = input_df.copy()
@@ -247,11 +160,12 @@ def check_barcodes(input_df, saved_history):
             if previous_compressors:
                 prev = max(previous_compressors, key=lambda rec: pd.Timestamp(rec["Creation Date"]))
                 label, days = gap_result(creation, prev["Resolve Date"])
-                warranty_references.append(("Compressor", prev))
                 if label == "Created Before Previous Resolve":
                     compressor_result = label
+                    warranty_references.append(("Compressor", prev))
                 elif days <= 90:
                     compressor_result = "Within 90 Days"
+                    warranty_references.append(("Compressor", prev))
                 else:
                     compressor_result = "After 90 Days"
             else:
@@ -266,11 +180,12 @@ def check_barcodes(input_df, saved_history):
             if previous_gas:
                 prev = max(previous_gas, key=lambda rec: pd.Timestamp(rec["Creation Date"]))
                 label, days = gap_result(creation, prev["Resolve Date"])
-                warranty_references.append(("Gas", prev))
                 if label == "Created Before Previous Resolve":
                     gas_result = label
+                    warranty_references.append(("Gas", prev))
                 elif days <= 90:
                     gas_result = "Within 90 Days"
+                    warranty_references.append(("Gas", prev))
                 else:
                     gas_result = "After 90 Days"
             else:
@@ -287,16 +202,21 @@ def check_barcodes(input_df, saved_history):
                 if previous_parts:
                     prev = max(previous_parts, key=lambda rec: pd.Timestamp(rec["Creation Date"]))
                     label, days = gap_result(creation, prev["Resolve Date"])
-                    part_matches.append((label, days))
-                    warranty_references.append(("Parts", prev))
+                    part_matches.append((label, days, prev))
             if part_matches:
-                # A repeated part is under warranty if any exact part match is within 30 days.
-                if any(label == "Created Before Previous Resolve" for label, _ in part_matches):
+                # Only retain references for exact repeated parts still within warranty.
+                valid_part_matches = [
+                    (label, days, prev) for label, days, prev in part_matches
+                    if label == "Created Before Previous Resolve" or days <= 30
+                ]
+                if any(label == "Created Before Previous Resolve" for label, _, _ in valid_part_matches):
                     parts_result = "Created Before Previous Resolve"
-                elif any(days <= 30 for _, days in part_matches):
+                elif valid_part_matches:
                     parts_result = "Within 30 Days"
                 else:
                     parts_result = "No Warranty Part"
+                for _, _, prev in valid_part_matches:
+                    warranty_references.append(("Parts", prev))
             else:
                 parts_result = "No Warranty Part"
 
@@ -311,11 +231,12 @@ def check_barcodes(input_df, saved_history):
             if previous_service:
                 prev = max(previous_service, key=lambda rec: pd.Timestamp(rec["Creation Date"]))
                 label, days = gap_result(creation, prev["Resolve Date"])
-                warranty_references.append(("Service", prev))
                 if label == "Created Before Previous Resolve":
                     service_result = label
+                    warranty_references.append(("Service", prev))
                 elif days <= 30:
                     service_result = "Within 30 Days"
+                    warranty_references.append(("Service", prev))
                 else:
                     service_result = "After 30 Days"
             else:
@@ -347,12 +268,8 @@ def check_barcodes(input_df, saved_history):
                 )
             out["Previous Order Number"] = "; ".join(order_parts)
             out["Previous Resolve Date"] = "; ".join(date_parts)
-        elif earlier:
-            # No matching warranty category; retain the latest barcode complaint reference.
-            previous = earlier[0]
-            out["Previous Order Number"] = str(previous.get("Order Number", "") or "")
-            out["Previous Resolve Date"] = pd.Timestamp(previous["Resolve Date"])
         else:
+            # No active warranty match: keep previous order/date blank.
             out["Previous Order Number"] = ""
             out["Previous Resolve Date"] = ""
 
@@ -580,7 +497,11 @@ def render_barcode_checking():
             st.dataframe(input_df.loc[bad], use_container_width=True); return
         if input_df.empty:
             st.warning("Excel file mein data nahi hai."); return
-        history = load_history()
+        # Read-only reference: only records already saved in Turso Master Data.
+        # The newly uploaded checking file is never inserted into any database.
+        uploaded_barcodes = sorted(input_df["Barcode"].dropna().astype(str).str.strip().unique().tolist())
+        master_df = master_fetch(uploaded_barcodes)
+        history = master_to_history(master_df)
         result_df = check_barcodes(input_df, history)
         a,b,c = st.columns(3)
         a.metric("Total Rows", len(result_df))
@@ -590,9 +511,7 @@ def render_barcode_checking():
         st.dataframe(result_df, use_container_width=True, hide_index=True)
         st.download_button("Download Results Excel", to_excel(result_df), "barcode_checking_results.xlsx",
                            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
-        if st.button("Save This File to Local Checking History", type="primary"):
-            save_history(input_df.to_dict(orient="records"))
-            st.success("Checking history save ho gayi.")
+        st.info("Yeh upload sirf temporary checking ke liye hai. Is file ke records database mein save nahi honge. Warranty reference sirf Turso Master Data se liya jata hai.")
     except Exception as exc:
         st.error(f"Checking mein error: {exc}")
 
@@ -735,4 +654,4 @@ elif page == "Warranty Search":
 elif page == "Export / Backup":
     render_export_backup()
 
-st.caption("Google-Code-Barcode | Master Data cloud database: Turso | Checking history: local SQLite")
+st.caption("Google-Code-Barcode | Turso Master Data: permanent records | Barcode Checking uploads: temporary only")
