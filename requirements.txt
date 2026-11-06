@@ -1,3 +1,5 @@
-libsql-client
+streamlit
 pandas
 openpyxl
+xlrd
+libsql-experimental
