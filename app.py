@@ -1,3 +1,611 @@
+import streamlit as st
+import pandas as pd
+import sqlite3
+import hmac
+import re
+from io import BytesIO
+from pathlib import Path
+
+# ---------------------------------------------------------
+# PAGE SETTINGS
+# ---------------------------------------------------------
+st.set_page_config(
+    page_title="Google-Code-Barcode",
+    page_icon="🔎",
+    layout="wide"
+)
+
+DB_PATH = Path("barcode_history.db")
+
+# ---------------------------------------------------------
+# LOGIN SECURITY
+# Set PORTAL_USERNAME and PORTAL_PASSWORD in Streamlit Cloud
+# Settings -> Secrets. Never put your real password in this file.
+# ---------------------------------------------------------
+if "logged_in" not in st.session_state:
+    st.session_state.logged_in = False
+
+if not st.session_state.logged_in:
+    st.title("Google-Code-Barcode")
+    st.subheader("Secure Login")
+
+    if "PORTAL_USERNAME" not in st.secrets or "PORTAL_PASSWORD" not in st.secrets:
+        st.error("Login setup is incomplete. Please add PORTAL_USERNAME and PORTAL_PASSWORD in Streamlit Cloud → App settings → Secrets.")
+        st.code(
+            'PORTAL_USERNAME = "your_username"\n'
+            'PORTAL_PASSWORD = "your_strong_password"',
+            language="toml"
+        )
+        st.stop()
+
+    with st.form("portal_login_form"):
+        username = st.text_input("Username")
+        password = st.text_input("Password", type="password")
+        submitted = st.form_submit_button("Login", use_container_width=True)
+
+    if submitted:
+        correct_username = str(st.secrets["PORTAL_USERNAME"])
+        correct_password = str(st.secrets["PORTAL_PASSWORD"])
+
+        username_ok = hmac.compare_digest(username, correct_username)
+        password_ok = hmac.compare_digest(password, correct_password)
+
+        if username_ok and password_ok:
+            st.session_state.logged_in = True
+            st.rerun()
+        else:
+            st.error("Username ya password ghalat hai.")
+
+    st.stop()
+
+# Keep login active during normal page interactions; logout is explicit.
+with st.sidebar:
+    st.success("Login successful")
+    if st.button("Logout", use_container_width=True):
+        st.session_state.logged_in = False
+        st.rerun()
+
+# ---------------------------------------------------------
+# DATABASE
+# ---------------------------------------------------------
+def get_connection():
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS barcode_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            order_number TEXT NOT NULL DEFAULT '',
+            barcode TEXT NOT NULL,
+            creation_date TEXT NOT NULL,
+            resolve_date TEXT NOT NULL,
+            remarks TEXT NOT NULL DEFAULT '',
+            UNIQUE(barcode, creation_date, resolve_date)
+        )
+        """
+    )
+    existing_columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(barcode_history)").fetchall()
+    }
+    if "order_number" not in existing_columns:
+        conn.execute("ALTER TABLE barcode_history ADD COLUMN order_number TEXT NOT NULL DEFAULT ''")
+    if "remarks" not in existing_columns:
+        conn.execute("ALTER TABLE barcode_history ADD COLUMN remarks TEXT NOT NULL DEFAULT ''")
+    conn.commit()
+    return conn
+
+
+# Recognized terms from the user's material list. Longer names are checked first
+# so "Door Gasket 400SAX Chest" is not confused with "Door Gasket 400SAX".
+MATERIAL_TERMS = [
+    ("Compressor", ["COMPRESSOR REFURBISHED R134 1/3 HP", "COMPRESSOR REPLACED", "COMPRESSOR"]),
+    ("Gas", ["GAS CHARGED", "GAS CHARGING", "GAS CHARGE", "GAS"]),
+    ("CFS Basic Service", ["CFS BASIC SERVICE"]),
+    ("Door Gasket 400SAX Chest", ["DOOR GASKET 400SAX CHEST"]),
+    ("Door Gasket 400SAX", ["DOOR GASKET 400SAX"]),
+    ("Compressor Condensor 1/3", ["CONDENSOR 1/3", "CONDENSER 1/3"]),
+    ("Capacitor", ["CAPACITOR"]),
+    ("Caster Wheel", ["CASTER WHEEL"]),
+    ("Fan Motor 10W", ["FAN MOTOR 10W"]),
+    ("Fan Motor 5W", ["FAN MOTOR 5W"]),
+    ("LED", ["LED REPLACED", "LED"]),
+    ("Power Cord Plug-VISI & Chest", ["POWER CORD PLUG-VISI & CHEST", "POWER CORD PLUG"]),
+    ("Relay", ["RELAY"]),
+    ("Overload", ["OVERLOAD"]),
+    ("Thermostat - Chest", ["THERMOSTAT - CHEST", "THERMOSTAT CHEST"]),
+    ("Door Complete Chest", ["DOOR COMPLETE CHEST"]),
+    ("Door Repaired", ["DOOR REPAIRED", "DOORREPAIRED"]),
+]
+
+
+def detect_materials(remarks):
+    """Return canonical materials found in a single Remarks cell."""
+    text = str(remarks or "").upper().replace("–", "-").replace("—", "-")
+    found = []
+    for canonical, terms in MATERIAL_TERMS:
+        # Match complete terms/phrases so "GAS" does not accidentally match "GASKET".
+        matched = any(
+            re.search(r"(?<![A-Z0-9])" + re.escape(term) + r"(?![A-Z0-9])", text)
+            for term in terms
+        )
+        if matched and canonical not in found:
+            found.append(canonical)
+    return found
+
+
+def is_part(material):
+    return material not in {"Compressor", "Gas", "CFS Basic Service"}
+
+
+def gap_result(current_creation, previous_resolve):
+    current_day = pd.Timestamp(current_creation).normalize()
+    previous_day = pd.Timestamp(previous_resolve).normalize()
+    if current_day < previous_day:
+        return "Created Before Previous Resolve", (current_day - previous_day).days
+    days = (current_day - previous_day).days
+    if days <= 30:
+        return "Within 30 Days", days
+    if days <= 90:
+        return "Within 90 Days", days
+    return "After 90 Days", days
+
+
+def load_history():
+    conn = get_connection()
+    try:
+        history = pd.read_sql_query(
+            "SELECT order_number, barcode, creation_date, resolve_date, remarks FROM barcode_history",
+            conn
+        )
+    finally:
+        conn.close()
+
+    records = []
+    for _, row in history.iterrows():
+        creation = pd.to_datetime(row["creation_date"], errors="coerce")
+        resolve = pd.to_datetime(row["resolve_date"], errors="coerce")
+        if pd.notna(creation) and pd.notna(resolve):
+            records.append({
+                "Order Number": str(row.get("order_number", "") or ""),
+                "Barcode": str(row["barcode"]),
+                "Creation Date": creation,
+                "Resolve Date": resolve,
+                "Remarks": str(row.get("remarks", "") or ""),
+                "Materials": detect_materials(row.get("remarks", "")),
+            })
+    return records
+
+
+def save_history(rows):
+    """Save barcode/date records and Remarks for future material warranty checks."""
+    conn = get_connection()
+    try:
+        conn.executemany(
+            """
+            INSERT INTO barcode_history
+                (order_number, barcode, creation_date, resolve_date, remarks)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(barcode, creation_date, resolve_date) DO UPDATE SET
+                order_number = CASE WHEN excluded.order_number != '' THEN excluded.order_number ELSE barcode_history.order_number END,
+                remarks = CASE WHEN excluded.remarks != '' THEN excluded.remarks ELSE barcode_history.remarks END
+            """,
+            [
+                (
+                    str(row.get("Order Number", "") or ""),
+                    str(row["Barcode"]),
+                    pd.Timestamp(row["Creation Date"]).strftime("%Y-%m-%d %H:%M:%S"),
+                    pd.Timestamp(row["Resolve Date"]).strftime("%Y-%m-%d %H:%M:%S"),
+                    str(row.get("Remarks", "") or ""),
+                )
+                for row in rows
+            ]
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def check_barcodes(input_df, saved_history):
+    """Check each warranty category independently and show separate result columns."""
+    working = input_df.copy()
+    working["__original_order"] = range(len(working))
+    working = working.sort_values(["Creation Date", "__original_order"], kind="stable")
+
+    previous_records = list(saved_history)
+    output_rows = []
+
+    for _, row in working.iterrows():
+        barcode = str(row["Barcode"]).strip()
+        creation = pd.Timestamp(row["Creation Date"])
+        resolve = pd.Timestamp(row["Resolve Date"])
+        remarks = str(row.get("Remarks", "") or "")
+        materials = detect_materials(remarks)
+
+        current_parts = [m for m in materials if is_part(m)]
+        current_has_compressor = "Compressor" in materials
+        current_has_gas = "Gas" in materials
+        current_is_service = not materials or materials == ["CFS Basic Service"]
+
+        earlier = [
+            rec for rec in previous_records
+            if str(rec.get("Barcode", "")).strip() == barcode
+            and pd.Timestamp(rec["Creation Date"]) < creation
+        ]
+        earlier.sort(key=lambda rec: pd.Timestamp(rec["Creation Date"]), reverse=True)
+
+        compressor_result = ""
+        gas_result = ""
+        parts_result = ""
+        service_result = ""
+        warranty_references = []  # (category, previous record used for that category)
+
+        # Compressor warranty: same barcode + compressor seen before; 90-day period.
+        if current_has_compressor:
+            previous_compressors = [
+                rec for rec in earlier
+                if "Compressor" in rec.get("Materials", detect_materials(rec.get("Remarks", "")))
+            ]
+            if previous_compressors:
+                prev = max(previous_compressors, key=lambda rec: pd.Timestamp(rec["Creation Date"]))
+                label, days = gap_result(creation, prev["Resolve Date"])
+                warranty_references.append(("Compressor", prev))
+                if label == "Created Before Previous Resolve":
+                    compressor_result = label
+                elif days <= 90:
+                    compressor_result = "Within 90 Days"
+                else:
+                    compressor_result = "After 90 Days"
+            else:
+                compressor_result = "No Previous Compressor"
+
+        # Gas warranty: same barcode + gas seen before; 90-day period.
+        if current_has_gas:
+            previous_gas = [
+                rec for rec in earlier
+                if "Gas" in rec.get("Materials", detect_materials(rec.get("Remarks", "")))
+            ]
+            if previous_gas:
+                prev = max(previous_gas, key=lambda rec: pd.Timestamp(rec["Creation Date"]))
+                label, days = gap_result(creation, prev["Resolve Date"])
+                warranty_references.append(("Gas", prev))
+                if label == "Created Before Previous Resolve":
+                    gas_result = label
+                elif days <= 90:
+                    gas_result = "Within 90 Days"
+                else:
+                    gas_result = "After 90 Days"
+            else:
+                gas_result = "No Previous Gas"
+
+        # Parts warranty: any same part repeats for the same barcode; 30-day period.
+        if current_parts:
+            part_matches = []
+            for material in current_parts:
+                previous_parts = [
+                    rec for rec in earlier
+                    if material in rec.get("Materials", detect_materials(rec.get("Remarks", "")))
+                ]
+                if previous_parts:
+                    prev = max(previous_parts, key=lambda rec: pd.Timestamp(rec["Creation Date"]))
+                    label, days = gap_result(creation, prev["Resolve Date"])
+                    part_matches.append((label, days))
+                    warranty_references.append(("Parts", prev))
+            if part_matches:
+                # A repeated part is under warranty if any exact part match is within 30 days.
+                if any(label == "Created Before Previous Resolve" for label, _ in part_matches):
+                    parts_result = "Created Before Previous Resolve"
+                elif any(days <= 30 for _, days in part_matches):
+                    parts_result = "Within 30 Days"
+                else:
+                    parts_result = "No Warranty Part"
+            else:
+                parts_result = "No Warranty Part"
+
+        # Service warranty is checked only when no actual part, compressor, or gas
+        # is recorded in the current complaint (CFS Basic Service counts as service).
+        if current_is_service:
+            previous_service = [
+                rec for rec in earlier
+                if not rec.get("Materials", detect_materials(rec.get("Remarks", "")))
+                or rec.get("Materials", detect_materials(rec.get("Remarks", ""))) == ["CFS Basic Service"]
+            ]
+            if previous_service:
+                prev = max(previous_service, key=lambda rec: pd.Timestamp(rec["Creation Date"]))
+                label, days = gap_result(creation, prev["Resolve Date"])
+                warranty_references.append(("Service", prev))
+                if label == "Created Before Previous Resolve":
+                    service_result = label
+                elif days <= 30:
+                    service_result = "Within 30 Days"
+                else:
+                    service_result = "After 30 Days"
+            else:
+                service_result = "First Service"
+
+        out = row.drop(labels=["__original_order"]).to_dict()
+        out["Detected Materials"] = ", ".join(materials) if materials else "Service"
+        out["Compressor Warranty"] = compressor_result
+        out["Gas Warranty"] = gas_result
+        out["Parts Warranty"] = parts_result
+        out["Service Warranty"] = service_result
+
+        # Keep the same two columns, but show the exact previous order/date
+        # used by each applicable warranty category.
+        if warranty_references:
+            # Preserve category order and avoid repeating identical category/order pairs.
+            order_parts = []
+            date_parts = []
+            seen_refs = set()
+            for category, prev in warranty_references:
+                ref_key = (category, str(prev.get("Order Number", "") or ""),
+                           str(pd.Timestamp(prev["Resolve Date"])))
+                if ref_key in seen_refs:
+                    continue
+                seen_refs.add(ref_key)
+                order_parts.append(f"{category}: {prev.get('Order Number', '') or 'Unknown'}")
+                date_parts.append(
+                    f"{category}: {pd.Timestamp(prev['Resolve Date']).strftime('%Y-%m-%d')}"
+                )
+            out["Previous Order Number"] = "; ".join(order_parts)
+            out["Previous Resolve Date"] = "; ".join(date_parts)
+        elif earlier:
+            # No matching warranty category; retain the latest barcode complaint reference.
+            previous = earlier[0]
+            out["Previous Order Number"] = str(previous.get("Order Number", "") or "")
+            out["Previous Resolve Date"] = pd.Timestamp(previous["Resolve Date"])
+        else:
+            out["Previous Order Number"] = ""
+            out["Previous Resolve Date"] = ""
+
+        if earlier:
+            latest_previous = earlier[0]
+            out["Days Between Complaints"] = (
+                creation.normalize() - pd.Timestamp(latest_previous["Resolve Date"]).normalize()
+            ).days
+        else:
+            out["Days Between Complaints"] = None
+
+        output_rows.append(out)
+
+        # Include this complaint in the working history for later rows in this upload.
+        previous_records.append({
+            "Order Number": str(row.get("Order Number", "") or ""),
+            "Barcode": barcode,
+            "Creation Date": creation,
+            "Resolve Date": resolve,
+            "Remarks": remarks,
+            "Materials": materials,
+        })
+
+    result_df = pd.DataFrame(output_rows)
+    preferred = [
+        "Order Number", "Barcode", "Creation Date", "Resolve Date", "Remarks",
+        "Detected Materials", "Previous Order Number", "Previous Resolve Date",
+        "Days Between Complaints", "Compressor Warranty", "Gas Warranty",
+        "Parts Warranty", "Service Warranty"
+    ]
+    ordered = [col for col in preferred if col in result_df.columns]
+    ordered += [col for col in result_df.columns if col not in ordered]
+    return result_df[ordered]
+
+
+def to_excel(df):
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="Barcode Results")
+    output.seek(0)
+    return output.getvalue()
+
+
+# ---------------------------------------------------------
+# TURSO CLOUD MASTER DATABASE (HTTP API; no libsql native wheel)
+# ---------------------------------------------------------
+def turso_settings():
+    try:
+        raw_url = str(st.secrets.get("TURSO_DATABASE_URL", "")).strip()
+        token = str(st.secrets.get("TURSO_AUTH_TOKEN", "")).strip()
+    except Exception:
+        raw_url, token = "", ""
+    if not raw_url or not token:
+        raise RuntimeError("Turso settings missing. Streamlit Secrets mein TURSO_DATABASE_URL aur TURSO_AUTH_TOKEN add karein.")
+    url = raw_url.rstrip("/")
+    if url.startswith("libsql://"):
+        url = "https://" + url[len("libsql://"):]
+    elif not url.startswith("https://"):
+        raise RuntimeError("TURSO_DATABASE_URL libsql:// ya https:// se start hona chahiye.")
+    return url + "/v2/pipeline", token
+
+
+def _hrana_value(value):
+    if value is None or pd.isna(value):
+        return {"type": "null"}
+    if isinstance(value, bool):
+        return {"type": "integer", "value": "1" if value else "0"}
+    if isinstance(value, int):
+        return {"type": "integer", "value": str(value)}
+    if isinstance(value, float):
+        return {"type": "float", "value": value}
+    return {"type": "text", "value": str(value)}
+
+
+def _decode_hrana(value):
+    if not isinstance(value, dict):
+        return value
+    typ = value.get("type")
+    if typ == "null": return None
+    if typ == "integer": return int(value.get("value", 0))
+    if typ == "float": return float(value.get("value", 0))
+    if typ == "text": return value.get("value", "")
+    if typ == "blob": return value.get("base64", "")
+    return value.get("value")
+
+
+def turso_pipeline(statements):
+    import requests
+    endpoint, token = turso_settings()
+    requests_list = []
+    for sql, params in statements:
+        requests_list.append({"type": "execute", "stmt": {
+            "sql": sql,
+            "args": [_hrana_value(v) for v in (params or [])]
+        }})
+    requests_list.append({"type": "close"})
+    response = requests.post(
+        endpoint,
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        json={"requests": requests_list},
+        timeout=60
+    )
+    if not response.ok:
+        raise RuntimeError(f"Turso HTTP error {response.status_code}: {response.text[:500]}")
+    payload = response.json()
+    outputs = []
+    for item in payload.get("results", []):
+        if item.get("type") == "error":
+            err = item.get("error", {})
+            raise RuntimeError(err.get("message", str(err)))
+        result = item.get("response", {}).get("result", {})
+        cols = [c.get("name", "") for c in result.get("cols", [])]
+        rows = [[_decode_hrana(v) for v in row] for row in result.get("rows", [])]
+        outputs.append({"columns": cols, "rows": rows, "affected": result.get("affected_row_count", 0)})
+    return outputs
+
+
+def ensure_master_table():
+    turso_pipeline([("""CREATE TABLE IF NOT EXISTS master_records (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        barcode TEXT NOT NULL,
+        order_number TEXT NOT NULL DEFAULT '',
+        creation_date TEXT NOT NULL,
+        resolve_date TEXT NOT NULL,
+        remarks TEXT NOT NULL DEFAULT '',
+        uploaded_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )""", [])])
+
+
+def master_insert(df):
+    ensure_master_table()
+    sql = "INSERT INTO master_records (barcode, order_number, creation_date, resolve_date, remarks) VALUES (?, ?, ?, ?, ?)"
+    rows = []
+    for _, row in df.iterrows():
+        rows.append((str(row['Barcode']), str(row['Order Number']),
+                     pd.Timestamp(row['Creation Date']).strftime('%Y-%m-%d %H:%M:%S'),
+                     pd.Timestamp(row['Resolve Date']).strftime('%Y-%m-%d %H:%M:%S'),
+                     str(row['Remarks'])))
+    # Small chunks keep HTTP request payloads manageable; duplicate rows are intentionally retained.
+    for start in range(0, len(rows), 100):
+        turso_pipeline([(sql, values) for values in rows[start:start+100]])
+
+
+def master_fetch(barcodes=None):
+    ensure_master_table()
+    if barcodes:
+        marks = ",".join(["?"] * len(barcodes))
+        sql = f"SELECT id, barcode, order_number, creation_date, resolve_date, remarks, uploaded_at FROM master_records WHERE barcode IN ({marks}) ORDER BY barcode, creation_date, id"
+        params = list(barcodes)
+    else:
+        sql = "SELECT id, barcode, order_number, creation_date, resolve_date, remarks, uploaded_at FROM master_records ORDER BY id DESC"
+        params = []
+    result = turso_pipeline([(sql, params)])[0]
+    cols = result["columns"]
+    return pd.DataFrame(result["rows"], columns=cols)
+
+
+def master_delete(ids):
+    ensure_master_table()
+    for start in range(0, len(ids), 100):
+        batch = ids[start:start+100]
+        marks = ",".join(["?"] * len(batch))
+        turso_pipeline([(f"DELETE FROM master_records WHERE id IN ({marks})", batch)])
+
+
+def prepare_master_upload(file):
+    df = pd.read_excel(file, dtype={"Order Number": str, "Barcode": str})
+    df.columns = [str(c).strip() for c in df.columns]
+    required = ["Barcode", "Order Number", "Creation Date", "Resolve Date", "Remarks"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError("Required columns missing: " + ", ".join(missing))
+    for col in ["Barcode", "Order Number", "Remarks"]:
+        df[col] = df[col].fillna("").astype(str).str.strip()
+    df["Creation Date"] = pd.to_datetime(df["Creation Date"], errors="coerce")
+    df["Resolve Date"] = pd.to_datetime(df["Resolve Date"], errors="coerce")
+    bad = df["Barcode"].eq("") | df["Creation Date"].isna() | df["Resolve Date"].isna()
+    if bad.any():
+        raise ValueError(f"{int(bad.sum())} rows mein Barcode ya date blank/invalid hai.")
+    return df[required]
+
+
+def master_to_history(df):
+    records = []
+    for _, row in df.iterrows():
+        c = pd.to_datetime(row["creation_date"], errors="coerce")
+        r = pd.to_datetime(row["resolve_date"], errors="coerce")
+        if pd.notna(c) and pd.notna(r):
+            remarks = str(row.get("remarks", "") or "")
+            records.append({"Order Number": str(row.get("order_number", "") or ""),
+                            "Barcode": str(row["barcode"]), "Creation Date": c,
+                            "Resolve Date": r, "Remarks": remarks,
+                            "Materials": detect_materials(remarks)})
+    return records
+
+
+def render_barcode_checking():
+    st.title("Google-Code-Barcode")
+    st.write("Excel file upload karein. Required columns: **Order Number, Barcode, Creation Date, Resolve Date, Remarks**.")
+    with st.expander("Rules / Checking Logic"):
+        st.markdown("""
+        - Remarks ke ek cell mein multiple materials ho sakte hain; portal unhein detect karega.
+        - Compressor Warranty: same barcode aur compressor repeat; 90 days.
+        - Gas Warranty: same barcode aur gas repeat; 90 days.
+        - Parts Warranty: same barcode aur same part repeat; 30 days.
+        - Service Warranty: service history ka warranty period 30 days.
+        - Gap current Creation Date minus previous matching complaint Resolve Date se calculate hota hai.
+        """)
+    uploaded_file = st.file_uploader("Excel file upload karein", type=["xlsx", "xls"], key="check_upload")
+    if uploaded_file is None: return
+    try:
+        input_df = pd.read_excel(uploaded_file, dtype={"Order Number": str, "Barcode": str})
+        input_df.columns = [str(c).strip() for c in input_df.columns]
+        required = ["Order Number", "Barcode", "Creation Date", "Resolve Date", "Remarks"]
+        missing = [c for c in required if c not in input_df.columns]
+        if missing:
+            st.error("Required columns missing: " + ", ".join(missing)); return
+        for col in ["Order Number", "Barcode", "Remarks"]:
+            input_df[col] = input_df[col].fillna("").astype(str).str.strip()
+        for col in ["Creation Date", "Resolve Date"]:
+            input_df[col] = pd.to_datetime(input_df[col], errors="coerce")
+        bad = input_df["Barcode"].eq("") | input_df["Creation Date"].isna() | input_df["Resolve Date"].isna()
+        if bad.any():
+            st.error(f"{int(bad.sum())} rows mein Barcode blank hai ya date ghalat hai.")
+            st.dataframe(input_df.loc[bad], use_container_width=True); return
+        if input_df.empty:
+            st.warning("Excel file mein data nahi hai."); return
+        history = load_history()
+        result_df = check_barcodes(input_df, history)
+        a,b,c = st.columns(3)
+        a.metric("Total Rows", len(result_df))
+        warranty_cols = ["Compressor Warranty", "Gas Warranty", "Parts Warranty", "Service Warranty"]
+        b.metric("Warranty Matches", int(result_df[warranty_cols].apply(lambda x: x.astype(str).str.startswith("Within ")).sum().sum()))
+        c.metric("No Warranty / First", int(result_df[warranty_cols].apply(lambda x: x.astype(str).str.contains("No Warranty|First ", case=False, regex=True)).sum().sum()))
+        st.dataframe(result_df, use_container_width=True, hide_index=True)
+        st.download_button("Download Results Excel", to_excel(result_df), "barcode_checking_results.xlsx",
+                           "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
+        if st.button("Save This File to Local Checking History", type="primary"):
+            save_history(input_df.to_dict(orient="records"))
+            st.success("Checking history save ho gayi.")
+    except Exception as exc:
+        st.error(f"Checking mein error: {exc}")
+
+
+def render_master_upload():
+    st.header("Master Data — Upload")
+    st.write("Excel upload karne par tamam records cloud database mein append honge. Duplicate rows bhi save hongi.")
+    st.caption("Required columns: Barcode, Order Number, Creation Date, Resolve Date, Remarks")
+    file = st.file_uploader("Master Excel upload karein", type=["xlsx", "xls"], key="master_upload")
+    if file is not None:
+        try:
+            df = prepare_master_upload(file)
+            st.info(f"{len(df):,} records upload ke liye ready hain.")
             st.dataframe(df.head(20), use_container_width=True, hide_index=True)
             if st.button("Append Records to Cloud Master Data", type="primary"):
                 with st.spinner("Records cloud database mein save ho rahe hain..."):
