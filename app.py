@@ -22,8 +22,12 @@ def query_turso(statements):
     
     requests_payload = []
     for item in statements:
-        sql = item[0]
-        params = item[1] if len(item) > 1 else []
+        if isinstance(item, list) and len(item) == 2:
+            sql = item[0]
+            params = item[1]
+        else:
+            sql = item[0] if isinstance(item, list) else item
+            params = []
         
         formatted_args = []
         for p in params:
@@ -71,7 +75,7 @@ def init_db():
         remarks TEXT
     )
     """
-    query_turso([[sql]])
+    query_turso([sql])
 
 init_db()
 
@@ -183,7 +187,7 @@ elif page == "Master Data":
                 
     with tabs[1]:
         st.subheader("Bulk Row Deletion Zone (Paste 'X' to remove rows)")
-        db_rows = query_turso([["SELECT id, barcode, order_no, creation_date, resolve_date, remarks FROM master_data LIMIT 1000"]])
+        db_rows = query_turso(["SELECT id, barcode, order_no, creation_date, resolve_date, remarks FROM master_data LIMIT 1000"])
         
         if db_rows:
             grid_data = []
