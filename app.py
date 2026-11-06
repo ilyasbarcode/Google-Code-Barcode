@@ -152,7 +152,6 @@ elif page == "Master Data":
         client = get_db_client()
         res = client.execute("SELECT id, barcode, order_no, creation_date, resolve_date, remarks FROM master_data LIMIT 1000")
         
-        # New Libsql API standard structure check adaptation
         db_rows = []
         if hasattr(res, 'rows') and res.rows:
             db_rows = res.rows
@@ -164,17 +163,21 @@ elif page == "Master Data":
         if db_rows:
             grid_data = []
             for r in db_rows:
-                # Adapting to dictionary row items or tuple row styles seamlessly
                 if hasattr(r, 'keys') or isinstance(r, dict):
                     grid_data.append({
                         "Select": "", "ID": r.get("id"), "Barcode": r.get("barcode"), 
                         "Order No": r.get("order_no"), "Creation Date": r.get("creation_date"), 
                         "Resolve Date": r.get("resolve_date"), "Remarks": r.get("remarks")
                     })
-                else:
+                elif isinstance(r, (list, tuple)) and len(r) >= 6:
                     grid_data.append({
                         "Select": "", "ID": r[0], "Barcode": r[1], "Order No": r[2], 
                         "Creation Date": r[3], "Resolve Date": r[4], "Remarks": r[5]
+                    })
+                else:
+                    grid_data.append({
+                        "Select": "", "ID": str(r), "Barcode": str(r), "Order No": str(r), 
+                        "Creation Date": str(r), "Resolve Date": str(r), "Remarks": str(r)
                     })
                     
             df_grid = pd.DataFrame(grid_data)
@@ -209,9 +212,3 @@ elif page == "Warranty Search":
             rows = res.rows
         elif isinstance(res, list):
             rows = res
-            
-        client.close()
-        
-        if rows:
-            query_list = []
-            for r in rows:
