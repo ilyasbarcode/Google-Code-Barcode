@@ -10,7 +10,6 @@ TURSO_AUTH_TOKEN = st.secrets.get("TURSO_AUTH_TOKEN", "")
 
 # Standardized direct API caller function
 def query_turso(statements):
-    # Standardizing URL format for HTTP endpoint
     url = TURSO_URL
     if url.startswith("libsql://"):
         url = url.replace("libsql://", "https://")
@@ -21,13 +20,11 @@ def query_turso(statements):
         "Content-Type": "application/json"
     }
     
-    # Building pipeline requests standard format
     requests_payload = []
-    for stmt in statements:
-        sql = stmt[0]
-        params = stmt[1] if len(stmt) > 1 else []
+    for item in statements:
+        sql = item[0]
+        params = item[1] if len(item) > 1 else []
         
-        # Format parameters for Turso API
         formatted_args = []
         for p in params:
             if isinstance(p, int):
@@ -227,3 +224,11 @@ elif page == "Master Data":
                         st.success("Selected records cleared successfully!")
                         st.rerun()
         else:
+            st.info("Database table is empty.")
+
+# --- 3. WARRANTY SEARCH ---
+elif page == "Warranty Search":
+    st.header("🔍 Direct Live Warranty Search")
+    search_query = st.text_input("Enter Barcode:")
+    
+    if search_query:
